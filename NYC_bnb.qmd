@@ -1,0 +1,787 @@
+---
+title: "New York City BnB Analysis"
+author: "Jokobus"
+date: last-modified
+format:
+  html:
+    toc: true
+    toc-depth: 4
+    code-fold: show
+    theme: cosmo
+execute:
+  warning: false
+  message: false
+---
+
+## 1. Executive Summary
+
+This project analyzes Bead and Breakfast pricing in New York City through exploratory data analysis, geospatial visualization, and predictive modeling. The goal is to understand which market features shape nightly rates, where the highest and lowest price concentrations occur, and how accurately those prices can be predicted from listing metadata.
+
+Several strong patterns emerge quickly. Manhattan dominates the upper end of the market, especially south of Central Park, while lower-priced listings are more broadly distributed across the outer boroughs. Room type, location, and listing structure all contribute meaningfully to price variation, and the dataset also shows a clear $999 ceiling that likely reflects a preprocessing cap rather than a true market boundary.
+
+The modeling section compares baseline linear regression, decision trees, and ensemble methods. The Random Forest model performs best on the holdout set and is therefore used for final prediction on the external evaluation file.
+
+### What This Report Covers
+
+* neighborhood and borough-level price structure
+* luxury and budget listing distributions
+* local clustering around major Manhattan landmarks
+* missing-value handling and kNN imputation checks
+* model comparison and evaluation-set prediction
+
+---
+
+## 2. Setup and Data Loading
+
+In this section, we set the system language to English and load all the required packages for spatial mapping, data wrangling, visualization, and machine learning.
+
+```{r setup}
+# Set language
+Sys.setenv(LANG = "en")
+
+# Define and load dependencies
+required_packages <- c(
+  "dplyr", "ggplot2", "leaflet", "randomForest", 
+  "caret", "e1071", "rpart", "rpart.plot", 
+  "doParallel", "caTools", "flexclust"
+)
+
+invisible(lapply(required_packages, library, character.only = TRUE))
+
+# Load dataset
+bnb <- read.csv("bnb_data.csv")
+head(bnb)
+
+```
+
+---
+
+## 3. Data Analysis and Visualization
+
+### 3.1 Which borough has the most rentals?
+The most rental listings are in the Bedford-Stuyvesant neighborhood, which contains 2,920 listings in the dataset.
+
+At the borough level, Manhattan has the largest concentration of listings (16,632), followed closely by Brooklyn (15,571). Queens, the Bronx, and Staten Island together account for fewer than 9,000 listings, which already hints at a strong concentration of supply in the city’s core.
+
+```{r neighborhood-distribution}
+# Listings count by neighborhood
+bnb %>% 
+  group_by(neighbourhood) %>% 
+  count() %>% 
+  arrange(desc(n)) %>% 
+  head()
+
+# Listings count by neighborhood group
+bnb %>% 
+  group_by(neighbourhood_group) %>% 
+  count() %>% 
+  arrange(desc(n))
+
+# Listing counts grouped by neighborhood and room type
+bnb %>% 
+  group_by(neighbourhood, room_type) %>% 
+  count() %>% 
+  arrange(desc(n))
+
+```
+
+### 3.2 Price Analysis and Geolocation Mapping
+
+To get a first overall impression, we analyze average prices across neighborhoods and visualize the city at several price thresholds. The static maps below use ggplot2 to make the spatial patterns easier to compare than a dense interactive layer would.
+
+The core pattern is straightforward: expensive BnBs are concentrated in Manhattan, especially in its central and southern neighborhoods. The mean listing price is about $174, and the observed maximum is $999. Before interpreting the top end of the market, we remove listings with price $0 so that obvious anomalies do not distort the summary statistics.
+
+```{r price-preprocessing, result='asis'}
+# Average price per neighborhood
+bnb %>% 
+  group_by(neighbourhood) %>% 
+  summarize(mean_price = mean(price, na.rm = TRUE))
+
+# Filter out listings with a price of 0 (Anomalies removed for standard analysis)
+bnb_preproc <- bnb
+bnb_0price_removed <- subset(bnb_preproc, price != 0.00)
+
+cat(paste("**Mean price of all BnB listings:**", mean(bnb_0price_removed$price), "<br><br>"))
+
+cat(paste("**Max price of any BnB listing:**", max(bnb_0price_removed$price), "<br><br>"))
+```
+
+#### 3.2.1 High-End Price Thresholds Spatial Distribution
+
+Here we examine the geographic distribution of listings at the luxury end of the market using three thresholds: $500, $900, and $999.
+
+```{r high-price-maps}
+# Figure 1: BnBs in NYC by price
+ggplot(bnb_0price_removed, aes(x = longitude, y = latitude)) + 
+  geom_point(aes(color = price)) + 
+  scale_x_continuous(limits = c(-74.25, -73.7)) + 
+  scale_y_continuous(limits = c(40.5, 40.92)) + 
+  scale_color_gradient(low = "gray", high = "red")
+
+# Figure 3: BnBs with a price of $500 or more
+ggplot(subset(bnb_0price_removed, price >= 500), aes(x = longitude, y = latitude)) + 
+  geom_point(data = bnb_0price_removed, color = "white", alpha = 0.3) + 
+  geom_point(aes(color = price)) + 
+  scale_x_continuous(limits = c(-74.25, -73.7)) + 
+  scale_y_continuous(limits = c(40.5, 40.92)) + 
+  scale_color_gradient(low = "gray", high = "red")
+
+# Figure 4: BnBs with a price of $900 or more
+ggplot(subset(bnb_0price_removed, price >= 900), aes(x = longitude, y = latitude)) + 
+  geom_point(data = bnb_0price_removed, color = "white", alpha = 0.3) + 
+  geom_point(aes(color = price)) + 
+  scale_x_continuous(limits = c(-74.25, -73.7)) + 
+  scale_y_continuous(limits = c(40.5, 40.92)) + 
+  scale_color_gradient(low = "gray", high = "red")
+
+# Figure 5: BnBs with a price of exactly $999
+ggplot(subset(bnb_0price_removed, price == 999), aes(x = longitude, y = latitude)) + 
+  geom_point(data = bnb_0price_removed, color = "white", alpha = 0.3) + 
+  geom_point(color = "red") + 
+  scale_x_continuous(limits = c(-74.25, -73.7)) + 
+  scale_y_continuous(limits = c(40.5, 40.92))
+
+```
+
+```{r high-price-metrics, results='asis'}
+# Distribution tables for high tier pricing
+cat(paste("**Number of listings with price >= \\$500:**", nrow(subset(bnb_0price_removed, price >= 500)), "<br><br>"))
+
+cat(paste("**Number of listings with price >= \\$900:**", nrow(subset(bnb_0price_removed, price >= 900)), "<br><br>"))
+
+# Neighborhood group breakdowns
+cat("**Neighborhood group breakdown for listings >= \\$900:**\n")
+sub_900 <- subset(bnb_0price_removed, price >= 900)
+
+# Simplify the tapply logic into a direct table count for cleaner rendering
+tab_900 <- table(sub_900$neighbourhood_group)
+print(knitr::kable(as.data.frame(tab_900), col.names = c("Neighborhood Group", "Count"), format = "html"))
+
+cat(paste("**Number of listings with price >= \\$999:**", nrow(subset(bnb_0price_removed, price >= 999)), "<br><br>"))
+
+cat("**Neighborhood group breakdown for listings >= \\$999:**\n")
+sub_999 <- subset(bnb_0price_removed, price >= 999)
+tab_999 <- table(sub_999$neighbourhood_group)
+print(knitr::kable(as.data.frame(tab_999), col.names = c("Neighborhood Group", "Count"), format = "html"))
+
+cat(paste("**Number of listings with price >= \\$1000:**", nrow(subset(bnb_0price_removed, price >= 1000)), "<br><br>"))
+```
+
+Most listings above $900 are in Manhattan, particularly south of Central Park. Exactly 184 of the 226 BnBs priced above $900 are in Manhattan, which is roughly 81 percent of that luxury subset. The remainder is concentrated mainly in north-west Brooklyn, suggesting that premium demand is not exclusive to Manhattan but is still heavily centered there.
+
+One especially notable artifact is the cluster of 67 BnBs listed at exactly $999, with none above $1,000. That pattern strongly suggests a ceiling introduced during preprocessing or listing normalization. Of those 67 listings, 60 are in Manhattan, which reinforces the idea that the top of the market is both geographically concentrated and artificially truncated.
+
+#### 3.2.2 Budget & Free Listings Analysis
+
+Next we look at lower-cost options for budget-conscious travelers using a $50 cutoff.
+
+Affordable BnBs are not limited to the outer boroughs. Even inside Manhattan, a small number of sub-$50 listings appear in highly desirable areas, although the broader concentration of budget listings expands rapidly north of Central Park and across the East River into Brooklyn. That spatial spread suggests that transit access matters almost as much as neighborhood identity for price-sensitive guests.
+
+At the extreme low end, a few listings appear at $10, and two of them still sit within Manhattan proper. The dataset also contains a small set of $0 entries. Those values are treated as anomalies and removed from the modeling pipeline so that the downstream price prediction task reflects actual market behavior rather than data errors.
+
+```{r budget-maps}
+# Figure 6: BnBs with a price of $50 or less
+budget_50 <- 50
+ggplot(subset(bnb_0price_removed, price <= budget_50), aes(x = longitude, y = latitude)) + 
+  geom_point(data = bnb_0price_removed, color = "white", alpha = 0.3) + 
+  geom_point(aes(size = budget_50 - price, color = price)) + 
+  scale_x_continuous(limits = c(-74.25, -73.7)) + 
+  scale_y_continuous(limits = c(40.5, 40.92)) + 
+  scale_color_gradient(low = "blue", high = "gray")
+
+# Figure 7: BnBs with a price of $10
+budget_10 <- 10
+ggplot(bnb_0price_removed, aes(x = longitude, y = latitude)) + 
+  geom_point(data = bnb_0price_removed, color = "white", alpha = 0.3) + 
+  scale_x_continuous(limits = c(-74.25, -73.7)) + 
+  scale_y_continuous(limits = c(40.5, 40.92)) + 
+  geom_point(data = subset(bnb_0price_removed, price <= budget_10), size = 5, color = "green")
+
+# Figure 8: Anomalous BnBs listed at $0
+ggplot(bnb_preproc, aes(x = longitude, y = latitude)) + 
+  geom_point(data = bnb_preproc, color = "white", alpha = 0.3) + 
+  scale_x_continuous(limits = c(-74.25, -73.7)) + 
+  scale_y_continuous(limits = c(40.5, 40.92)) + 
+  geom_point(data = subset(bnb_preproc, price == 0), size = 5, color = "green")
+
+```
+
+#### 3.2.3 Neighborhood Rankings
+
+To identify the neighborhoods with the highest and lowest average prices, we compute neighborhood-level means after excluding very small groups with fewer than three active listings. This avoids unstable estimates from places such as New Dorp, Bull's Head, Country Club, Fort Wadsworth, and Hollis Hills.
+
+| Neighborhood (High Tier) | Mean Price | Neighborhood (Low Tier) | Mean Price |
+| :--- | :--- | :--- | :--- |
+| **Theater District** | $425 | **West Farms** | $74 |
+| **Tribeca** | $359 | **Grant City** | $61 |
+
+: Table 1: Highest and lowest mean prices depending on neighborhood (rounded)
+
+Theater District and Tribeca are premium neighborhoods in Manhattan, whereas West Farms and Grant City sit in the Bronx and Staten Island respectively. The gap between these tiers underscores how strongly location alone can separate high-value and low-value micro-markets.
+
+```{r neighborhood-rankings}
+# Sort average price by neighborhood descending
+sort(tapply(bnb_0price_removed$price, bnb_0price_removed$neighbourhood, mean), decreasing = TRUE)
+
+# Verification of sample volume (e.g., Grant City)
+nrow(subset(bnb_0price_removed, neighbourhood == "Grant City"))
+
+```
+
+#### 3.2.4 Micro-scale effects on Pricing
+
+On a micro-scale, local points of interest can shape nearby rental prices. In the interactive layout below, Penn Station, Times Square, and Madison Square Garden are marked. Premium pricing forms visible bands around Penn Station and Times Square, showing how access to transit, retail, and entertainment can lift baseline value inside a few city blocks.
+
+```{r interactive-map}
+# Figure 9: Interactive map highlighting regional POIs
+bnb_0price_removed$LogPrice <- log(bnb_0price_removed$price)
+bnb_0price_removed$Lat <- round(bnb_0price_removed$latitude, 3)
+bnb_0price_removed$Lon <- round(bnb_0price_removed$longitude, 3)
+pal <- colorNumeric("YlOrRd", domain = bnb_0price_removed$price)
+
+leaflet(bnb_0price_removed) %>% 
+  addTiles() %>% 
+  addCircles(
+    lng=~Lon, lat=~Lat, radius = 50, stroke=FALSE, 
+    fillColor=~pal(price), fillOpacity = 0.8, 
+    label=~paste0(neighbourhood,": ", 
+    format(round(price),big.mark=","), 
+    " (Lat,Lon): ",Lat,", ",Lon)) %>% 
+  addLegend(pal=pal, values=~price, opacity = 0.8) %>% 
+  addMarkers(lng = ~-73.9860, lat = ~40.7558, icon = list(iconUrl = 'https://icons.iconarchive.com/icons/icons-land/vista-map-markers/256/Map-Marker-Marker-Outside-Azure-icon.png', iconSize = c(30, 30))) %>% 
+  addMarkers(lng = ~-73.992, lat = ~40.75, icon = list(iconUrl = 'https://icons.iconarchive.com/icons/icons-land/vista-map-markers/256/Map-Marker-Marker-Outside-Chartreuse-icon.png', iconSize = c(30, 30))) %>% 
+  addMarkers(lng = ~-73.988, lat = ~40.742, icon = list(iconUrl = 'https://icons.iconarchive.com/icons/icons-land/vista-map-markers/256/Map-Marker-Marker-Outside-Pink-icon.png', iconSize = c(30, 30)))
+
+```
+
+#### 3.2.5 Room Type Impact on Pricing
+
+| Room Type | Mean Price | Number of Listings |
+| :--- | :--- | :--- |
+| **Entire home/apt** | $220 | 23,078 |
+| **Hotel room** | $393 | 138 |
+| **Private room** | $111 | 16,914 |
+| **Shared room** | $94 | 523 |
+
+: Table 2: Room type statistics (rounded)
+
+Entire homes/apartments and private rooms make up the vast majority of options. Hotel listings remain rare, likely because commercial hospitality operators prefer their own booking channels and do not rely on marketplace-style platforms as heavily.
+
+Private rooms provide the clearest low-cost alternative. In the luxury layer above $900, the market is still dominated by entire homes, although the presence of two shared-room listings above that threshold suggests some entries may be mislabeled or otherwise anomalous. By contrast, the sub-$50 segment is overwhelmingly private-room driven, with far more affordable private rooms than entire homes.
+
+```{r room-type-analysis, results='asis'}
+# Figure 10: BnBs sorted by room type
+p10 <- ggplot(bnb_0price_removed, aes(x = longitude, y = latitude)) + 
+  geom_point(aes(color = room_type)) + 
+  scale_x_continuous(limits = c(-74.25, -73.7)) + 
+  scale_y_continuous(limits = c(40.5, 40.92))
+print(p10)
+
+# Mean price calculations per category
+cat("**Mean price calculations per category:**\n")
+mean_entire <- round(mean(subset(bnb_0price_removed, room_type == "Entire home/apt")$price), 2)
+mean_hotel  <- round(mean(subset(bnb_0price_removed, room_type == "Hotel room")$price), 2)
+mean_priv   <- round(mean(subset(bnb_0price_removed, room_type == "Private room")$price), 2)
+mean_shared <- round(mean(subset(bnb_0price_removed, room_type == "Shared room")$price), 2)
+
+cat(paste("* **Entire home/apt:** \\$", mean_entire, "<br>"))
+cat(paste("* **Hotel room:** \\$", mean_hotel, "<br>"))
+cat(paste("* **Private room:** \\$", mean_priv, "<br>"))
+cat(paste("* **Shared room:** \\$", mean_shared, "<br><br>"))
+
+# Row counts per category
+cat("**Row counts per category:**\n")
+tab_rooms <- table(bnb_0price_removed$room_type)
+print(knitr::kable(as.data.frame(tab_rooms), col.names = c("Room Type", "Count"), format = "html"))
+
+# Figure 11: BnBs for over $900, sorted by room type
+p11 <- ggplot(subset(bnb_0price_removed, price >= 900), aes(x = longitude, y = latitude)) + 
+  geom_point(data = bnb_0price_removed, color = "white", alpha = 0.2) + 
+  geom_point(aes(color = room_type)) + 
+  scale_x_continuous(limits = c(-74.25, -73.7)) + 
+  scale_y_continuous(limits = c(40.5, 40.92))
+print(p11)
+
+# Figure 12: BnBs for less than $50, sorted by room type
+p12 <- ggplot(subset(bnb_0price_removed, price <= 50), aes(x = longitude, y = latitude)) + 
+  geom_point(data = bnb_0price_removed, color = "white", alpha = 0.2) + 
+  geom_point(aes(color = room_type)) + 
+  scale_x_continuous(limits = c(-74.25, -73.7)) + 
+  scale_y_continuous(limits = c(40.5, 40.92))
+print(p12)
+
+# Figure 13: BnBs for less than $10, sorted by room type
+p13 <- ggplot(subset(bnb_0price_removed, price <= 10), aes(x = longitude, y = latitude)) + 
+  geom_point(data = bnb_0price_removed, color = "white", alpha = 0.2) + 
+  geom_point(aes(color = room_type)) + 
+  scale_x_continuous(limits = c(-74.25, -73.7)) + 
+  scale_y_continuous(limits = c(40.5, 40.92))
+print(p13)
+
+```
+
+### 3.3 Deep Dive: Harlem
+
+Harlem is a useful neighborhood-level case study because it combines a large listing base with noticeable internal price variation. We find 1,936 active BnB listings there, with a mean price of $141.43 and a standard deviation of $114.06. The map patterns show that affordable listings under $50 are scarce in central Harlem, which indicates localized pricing premiums even inside a single neighborhood.
+
+```{r harlem-analysis}
+harlem_subset <- subset(bnb_0price_removed, neighbourhood == "Harlem")
+
+cat(paste("**Mean price of BnB listings in Harlem:**", mean(harlem_subset$price), "<br><br>"))
+
+cat(paste("**Standard deviation of BnB listings in Harlem:**", sd(harlem_subset$price), "<br><br>"))
+
+cat(paste("**Number of listings in Harlem:**", nrow(harlem_subset), "<br><br>"))
+
+# Figure 14: All BnBs in Harlem
+ggplot(harlem_subset, aes(x = longitude, y = latitude)) + 
+  geom_point(data = bnb_0price_removed, color = "white", alpha = 0.3) + 
+  geom_point(color = "red") + 
+  scale_x_continuous(limits = c(-74.25, -73.7)) + 
+  scale_y_continuous(limits = c(40.5, 40.92))
+
+# Figure 15: All BnBs in Harlem with a price of less than $50
+ggplot(subset(harlem_subset, price <= 50), aes(x = longitude, y = latitude)) + 
+  geom_point(data = bnb_0price_removed, color = "white", alpha = 0.3) + 
+  geom_point(color = "red") + 
+  scale_x_continuous(limits = c(-74.25, -73.7)) + 
+  scale_y_continuous(limits = c(40.5, 40.92))
+
+# Figure 16: All BnBs in Harlem with a price of more than $200
+ggplot(subset(harlem_subset, price >= 200), aes(x = longitude, y = latitude)) + 
+  geom_point(data = bnb_0price_removed, color = "white", alpha = 0.3) + 
+  geom_point(color = "red") + 
+  scale_x_continuous(limits = c(-74.25, -73.7)) + 
+  scale_y_continuous(limits = c(40.5, 40.92))
+
+```
+
+### 3.4 Find factors (beside location and room type) that influence Pricing
+
+The dataset contains missing entries across several features: 3,751 NAs in `bedrooms`, 890 NAs in `beds`, 5 NAs in `host_since`, and 8,889 NAs in `last_review`. 
+
+To assess if location metrics inject bias into structural features during data imputation, we run two separate parallelized kNN imputations: one including spatial parameters and one excluding them. The cross-imputation RMSE difference is quite small (0.05 for beds, 0.09 for bedrooms), meaning spatial variables have a negligible impact on structural imputation.
+
+```{r missing-values-knn}
+# Locate missing items
+table(is.na(bnb_0price_removed))
+colSums(is.na(bnb_0price_removed %>% select(host_since, room_type, accommodates, bathrooms_text, bedrooms, beds, price, number_of_reviews, last_review)))
+
+knn_file <- ".cache/knn_imputation_1.rds"
+
+if (!file.exists(knn_file)) {
+  # Imputation using 8 parallel cluster workers
+  cl <- makePSOCKcluster(8) 
+  registerDoParallel(cl)
+
+  preProc <- preProcess(bnb_0price_removed %>% select(host_since, neighbourhood, neighbourhood_group, latitude, longitude, room_type, accommodates, bathrooms_text, bedrooms, beds, number_of_reviews, last_review), method = "knnImpute")
+  bnb_imputed <- predict(preProc, bnb_0price_removed)
+
+  # Comparative Imputation (Excluding localization indices)
+  preProc2 <- preProcess(bnb_0price_removed %>% select(host_since, room_type, accommodates, bathrooms_text, bedrooms, beds, number_of_reviews, last_review), method = "knnImpute")
+  bnb_imputed2 <- predict(preProc2, bnb_0price_removed)
+
+  stopCluster(cl)
+  
+  # Cache the output structures
+  saveRDS(list(bnb_imputed = bnb_imputed, bnb_imputed2 = bnb_imputed2), knn_file)
+} else {
+  cached_knn <- readRDS(knn_file)
+  bnb_imputed <- cached_knn$bnb_imputed
+  bnb_imputed2 <- cached_knn$bnb_imputed2
+}
+
+# RMSE evaluations for Beds and Bedrooms
+RMSE_beds <- sqrt(sum((bnb_imputed$beds - bnb_imputed2$beds)^2) / nrow(bnb_imputed))
+RMSE_bedrooms <- sqrt(sum((bnb_imputed$bedrooms - bnb_imputed2$bedrooms)^2) / nrow(bnb_imputed))
+
+print(paste("Beds RMSE Cross-Check:", RMSE_beds))
+print(paste("Bedrooms RMSE Cross-Check:", RMSE_bedrooms))
+
+```
+
+#### Exploratory Variables vs Price Relations
+
+Plotting features against raw pricing shows that tenure (`host_since`) has little to no correlation with price. 
+
+Looking at `number_of_reviews`, the bulk of highly reviewed properties cluster within mid-tier price ranges. By grouping these into discrete bins, we can see how the mean price behaves across different review volumes, which helps highlight trends that are less visible in a standard scatter plot.
+
+```{r feature-plots}
+# Figure 17: Host since vs Price
+bnb_imputed %>% ggplot() + geom_point(aes(x = host_since, y = price))
+
+# Figure 18 & 19: Room type and Accommodates vs Price
+bnb_imputed %>% ggplot() + geom_point(aes(x = room_type, y = price))
+bnb_imputed %>% ggplot() + geom_point(aes(x = accommodates, y = price))
+
+# Figure 21 & 22: Structural variables under Log Transformation
+# Figure 24: Binned Review Counts vs Mean Price
+bnb_imputed %>%
+  mutate(bin_number_of_reviews = cut(number_of_reviews, breaks = seq(0, max(number_of_reviews) + 5, by = 1), include.lowest = TRUE)) %>%
+  group_by(bin_number_of_reviews) %>%
+  summarise(mean_price = mean(price, na.rm = TRUE)) %>%
+  head(20) %>%
+  ggplot() +
+  geom_bar(aes(x = bin_number_of_reviews, y = mean_price), stat = "identity", fill = "blue", color = "black") +
+  labs(x = "Number of Reviews", y = "Mean Price per bin") +
+  theme(axis.text.x = element_text(angle = 90))
+
+```
+
+### 3.5 Host Growth Analysis
+
+Evaluating historical host registrations shows that platform growth peaked in 2015, followed by a steady drop in new host additions over the following years.
+
+| 2008 | 2009 | 2010 | 2011 | 2012 | 2013 | 2014 | 2015 | 2016 | 2017 | 2018 | 2019 | 2020 | 2021 | 2022 |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| 13 | 2003 | 587 | 1577 | 3104 | 3427 | 4877 | **5364** | 4689 | 3384 | 3124 | 3252 | 1825 | 2669 | 2547 |
+
+: Table 3: Amount of new hosts registered per calendar year
+
+
+```{r host-growth}
+# Figure 26: Histogram of host enrollment waves
+bnb_0price_removed$host_since_year <- as.numeric(gsub("^.*?/", "", gsub("^.*?/", "", bnb_0price_removed$host_since)))
+table(bnb_0price_removed$host_since_year)
+hist(bnb_0price_removed$host_since_year, main = "Histogram of new hosts", xlab = "Year", col = "lightblue")
+
+```
+
+### 3.6 Revenue Insights
+
+Assuming that each review represents a single-night stay, we can estimate baseline revenue by multiplying review counts by price. Under this formula, the single most profitable account label is **"Sonder (NYC)"** (Host ID: 21951781). 
+
+While a single studio listing of theirs recorded 1,666 nights and generated $1,112,888 in revenue, note that Sonder operates as an institutional hospitality brand with many properties across New York, meaning their total aggregate platform revenue is substantially higher.
+
+```{r revenue-insights}
+bnb_0price_removed$revenue <- bnb_0price_removed$price * bnb_0price_removed$number_of_reviews
+
+# Max revenue entry
+bnb_0price_removed[which.max(bnb_0price_removed$revenue), ]
+
+# Max review count entry
+bnb_0price_removed[which.max(bnb_0price_removed$number_of_reviews), ]
+
+# Distributions breakdown
+hist(bnb_0price_removed$revenue, main = "Histogram of revenue", col = "lightgreen")
+
+```
+
+### 3.7 Projected Commission Calculations
+
+Applying a standard 3% platform commission fee structure against the total calculated NYC revenue reservoir ($183,731,287) yields projected platform corporate earnings of $5,511,939.
+
+```{r commission}
+0.03 * sum(bnb_0price_removed$revenue)
+
+```
+
+### 3.8 Travel Advice for Fellow Students
+
+For students on a budget, affordable BnB options are most concentrated in Northern Manhattan, Northern Brooklyn, and Northern Queens. Even so, sub-$50 accommodations can be found in almost every borough with enough search effort.
+
+---
+
+## 4. Predictive Modeling
+
+### 4.0 Data Re-Preprocessing and Partitioning
+
+Before training the models, we drop metadata columns (`id`, `name`, `host_id`, `host_name`), convert date fields to numeric format, and factor-encode string fields. We then split the data into a 70/30 train/test partition using a fixed seed of 100.
+
+```{r modeling-preprocess}
+preprocess_cache_file <- ".cache/modeling_splits.rds"
+
+if (!file.exists(preprocess_cache_file)) {
+  bnb_0price_removed <- subset(bnb, bnb$price != 0)
+  bnb_0price_removed$host_since <- as.numeric(as.Date(bnb_0price_removed$host_since, "%m/%d/%Y"))
+  bnb_0price_removed$last_review <- as.numeric(as.Date(bnb_0price_removed$last_review, "%m/%d/%Y"))
+
+  # Strip metadata labels
+  bnb_0price_removed$id <- NULL
+  bnb_0price_removed$name <- NULL
+  bnb_0price_removed$host_id <- NULL
+  bnb_0price_removed$host_name <- NULL
+
+  bnb_0price_removed$neighbourhood <- as.numeric(factor(bnb_0price_removed$neighbourhood, levels = unique(bnb_0price_removed$neighbourhood)))
+  bnb_0price_removed$neighbourhood_group <- as.numeric(factor(bnb_0price_removed$neighbourhood_group, levels = unique(bnb_0price_removed$neighbourhood_group)))
+  bnb_0price_removed$room_type <- as.numeric(factor(bnb_0price_removed$room_type, levels = unique(bnb_0price_removed$room_type)))
+  bnb_0price_removed$bathrooms_text <- as.numeric(factor(bnb_0price_removed$bathrooms_text, levels = unique(bnb_0price_removed$bathrooms_text)))
+
+  # Re-impute missing fields 
+  cl <- makePSOCKcluster(4)
+  registerDoParallel(cl)
+  preProc <- preProcess(bnb_0price_removed %>% select(host_since, neighbourhood, neighbourhood_group, latitude, longitude, room_type, accommodates, bathrooms_text, bedrooms, beds, number_of_reviews, last_review), method = "knnImpute")
+  stopCluster(cl)
+
+  bnb_0price_removed_imputed <- predict(preProc, bnb_0price_removed)
+
+  # Merge imputed variables back into standard dataframe
+  bnb_0price_removed$host_since <- bnb_0price_removed_imputed$host_since
+  bnb_0price_removed$bedrooms <- bnb_0price_removed_imputed$bedrooms
+  bnb_0price_removed$beds <- bnb_0price_removed_imputed$beds
+  bnb_0price_removed$last_review <- bnb_0price_removed_imputed$last_review
+
+  # Partition data split
+  set.seed(100)
+  split <- sample.split(bnb_0price_removed$price, SplitRatio = 0.7)
+  Train <- subset(bnb_0price_removed, split == TRUE)
+  Test <- subset(bnb_0price_removed, split == FALSE)
+  
+  saveRDS(list(Train = Train, Test = Test), preprocess_cache_file)
+} else {
+  cached_splits <- readRDS(preprocess_cache_file)
+  Train <- cached_splits$Train
+  Test <- cached_splits$Test
+}
+
+```
+
+### 4.1 Linear Regression Model
+
+We fit a baseline OLS linear regression model using all available features. While all predictors are statistically significant at a $p < 0.05$ threshold, the model struggles with high-end luxury properties, resulting in a test set RMSE of 116.45.
+
+```{r linear-regression}
+# Figure 27: Linear Regression Predictions vs Actuals
+lin.mod <- lm(price ~ ., data = Train)
+summary(lin.mod)
+
+lin.mod.pred <- predict(lin.mod, newdata = Test)
+plot(Test$price, lin.mod.pred) + abline(coef = c(0, 1), col = "blue")
+
+lin.mod.RMSE <- sqrt(sum((Test$price - lin.mod.pred)^2) / nrow(Test))
+lin.mod.RMSE
+
+```
+
+::: {.callout-note}
+### Note on Logistic Regression Model
+A standard logistic (`binomial`) regression is not applicable here, as the target variable `price` is continuous rather than binary.
+:::
+
+### 4.2 CART Models
+
+#### 4.2.A Classification Variant
+Running a CART classification tree directly on this continuous target vector results in a single-node failure, as it is unable to split a continuous regression target effectively using classification criteria.
+
+```{r cart-classification}
+# Figure 28: Failed Classification Tree Single Node output
+tree.CART_class <- rpart(price ~ ., data = Train, method = "class")
+tree.CART.pred_class <- predict(tree.CART_class, newdata = Test, type = "class")
+plot(Test$price, as.numeric(tree.CART.pred_class)) + abline(coef = c(0, 1), col = "blue")
+
+```
+
+#### 4.2.B Regression Variant
+Switching to an ANOVA method for a regression tree provides a much better result, yielding a structured tree diagram and a lower testing RMSE of 113.16.
+
+```{r cart-regression}
+# Figure 29 & 30: Regression Tree Architecture and Evaluation
+tree.CART_anova <- rpart(price ~ ., data = Train, method = "anova")
+tree.CART.pred_anova <- predict(tree.CART_anova, newdata = Test)
+prp(tree.CART_anova)
+
+plot(Test$price, tree.CART.pred_anova) + abline(coef = c(0, 1), col = "blue")
+
+CART.RMSE <- sqrt(sum((Test$price - tree.CART.pred_anova)^2) / nrow(Test))
+CART.RMSE
+
+```
+
+### 4.3 Fine-Tuning Hyperparameters via Cross-Validation
+
+Using 15-fold cross-validation across a complex complexity parameter (`cp`) grid improves performance, bringing the optimal tree's testing RMSE down to 102.61.
+
+```{r tuned-cart}
+cart_cache_file <- ".cache/tuned_cart.rds"
+
+if (!file.exists(cart_cache_file)) {
+  tr.control <- trainControl(method = "cv", number = 15) 
+  cp.grid <- expand.grid(.cp = (0:100) * 0.001)
+
+  set.seed(100)
+  cl <- makePSOCKcluster(4)
+  registerDoParallel(cl)
+
+  all.trees <- train(price ~ ., data = Train, method = "rpart", trControl = tr.control, tuneGrid = cp.grid)
+
+  stopCluster(cl)                
+  saveRDS(all.trees, cart_cache_file)
+} else {
+  all.trees <- readRDS(cart_cache_file)
+}
+
+best.tree <- all.trees$finalModel
+best.tree.pred <- predict(best.tree, newdata = Test)
+prp(best.tree)
+
+best.tree.RMSE <- sqrt(sum((Test$price - best.tree.pred)^2) / nrow(Test))
+best.tree.RMSE
+
+```
+
+### 4.4 Random Forest
+
+Next, we train a Random Forest model. This ensemble approach handles high-end price variations much better than the previous linear models, reducing the testing RMSE to 88.11.
+
+```{r random-forest}
+rf_cache_file <- ".cache/random_forest.rds"
+
+if (!file.exists(rf_cache_file)) {
+  cl <- makePSOCKcluster(4)
+  registerDoParallel(cl) 
+
+  set.seed(100)
+  forest.mod <- randomForest(price ~ ., data = Train, method = "class")
+  
+  stopCluster(cl)
+  saveRDS(forest.mod, rf_cache_file)
+} else {
+  forest.mod <- readRDS(rf_cache_file)
+}
+
+forest.pred <- predict(forest.mod, newdata = Test, type = "class")
+plot(Test$price, forest.pred) + abline(coef = c(0, 1), col = "blue")
+
+forest.RMSE <- sqrt(sum((Test$price - forest.pred)^2) / nrow(Test))
+forest.RMSE
+
+```
+
+### 4.5 Cluster-Based Sub-Models (K-Means Split)
+
+We also test a multi-stage approach: segmenting normalized training coordinates into three distinct clusters using K-Means, and then training an independent Random Forest model within each cluster partition.
+
+```{r cluster-modeling}
+# Feature Normalization
+preproc_norm <- preProcess(Train)
+normTrain <- predict(preproc_norm, Train)
+normTest <- predict(preproc_norm, Test)                     
+
+set.seed(100)
+KMC <- kmeans(normTrain, centers = 3)
+table(KMC$cluster)
+
+# Cluster Assignments 
+km.kcca <- as.kcca(KMC, normTrain)
+clusterTrain <- predict(km.kcca)
+clusterTest <- predict(km.kcca, newdata = normTest)
+
+# Segment Data Frames
+Train1 <- subset(Train, clusterTrain == 1)
+Train2 <- subset(Train, clusterTrain == 2)
+Train3 <- subset(Train, clusterTrain == 3)
+
+Test1 <- subset(Test, clusterTest == 1)
+Test2 <- subset(Test, clusterTest == 2)
+Test3 <- subset(Test, clusterTest == 3)
+
+cluster_rf_cache <- ".cache/cluster_rfs.rds"
+
+if (!file.exists(cluster_rf_cache)) {
+  # Training Cluster Random Forests
+  cl2 <- makePSOCKcluster(8)
+  registerDoParallel(cl2) 
+
+  set.seed(100)
+  forest.mod1 <- randomForest(price ~ ., data = Train1, method = "class")
+  forest.mod2 <- randomForest(price ~ ., data = Train2, method = "class")
+  forest.mod3 <- randomForest(price ~ ., data = Train3, method = "class")
+
+  stopCluster(cl2)
+  
+  saveRDS(list(m1 = forest.mod1, m2 = forest.mod2, m3 = forest.mod3), cluster_rf_cache)
+} else {
+  cached_mods <- readRDS(cluster_rf_cache)
+  forest.mod1 <- cached_mods$m1
+  forest.mod2 <- cached_mods$m2
+  forest.mod3 <- cached_mods$m3
+}
+
+forest.pred1 <- predict(forest.mod1, newdata = Test1, type = "class")
+forest.pred2 <- predict(forest.mod2, newdata = Test2, type = "class")
+forest.pred3 <- predict(forest.mod3, newdata = Test3, type = "class")
+
+# Evaluation metrics per cluster
+forest1.RMSE <- sqrt(sum((Test1$price - forest.pred1)^2) / nrow(Test1))
+forest2.RMSE <- sqrt(sum((Test2$price - forest.pred2)^2) / nrow(Test2))
+forest3.RMSE <- sqrt(sum((Test3$price - forest.pred3)^2) / nrow(Test3))
+
+print(mean(c(forest1.RMSE, forest2.RMSE, forest3.RMSE)))
+
+```
+
+### 4.6 Evaluation Set Predictions
+
+Comparing our models shows that the Random Forest architecture achieves the lowest overall RMSE.
+
+| Model Variant | Linear Regression | Standard CART | CV-Tuned Tree | Random Forest | K-Means Divided RF |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| **Testing RMSE** | 116.4534 | 113.1646 | 102.6055 | **88.11195** | *Ensemble Evaluated* |
+
+: Table 4: Final comparison of model error metrics
+
+We retrain our selected Random Forest architecture across the complete dataset and generate final price predictions for the external validation set (`bnb_data_eval.csv`).
+
+```{r validation-scoring}
+eval_prediction_cache <- ".cache/eval_predictions.rds"
+Evaluate_original <- read.csv("bnb_data_eval.csv")
+
+if (!file.exists(eval_prediction_cache)) {
+  # Finalize global preprocessing transformations on the base BnB data
+  BnB <- subset(bnb, bnb$price != 0)
+  BnB$host_since <- as.numeric(as.Date(BnB$host_since, "%m/%d/%Y"))
+  BnB$last_review <- as.numeric(as.Date(BnB$last_review, "%m/%d/%Y"))
+  BnB$id <- NULL; BnB$name <- NULL; BnB$host_id <- NULL; BnB$host_name <- NULL
+
+  BnB$neighbourhood <- as.numeric(factor(BnB$neighbourhood, levels = unique(BnB$neighbourhood)))
+  BnB$neighbourhood_group <- as.numeric(factor(BnB$neighbourhood_group, levels = unique(BnB$neighbourhood_group)))
+  BnB$room_type <- as.numeric(factor(BnB$room_type, levels = unique(BnB$room_type)))
+  BnB$bathrooms_text <- as.numeric(factor(BnB$bathrooms_text, levels = unique(BnB$bathrooms_text)))
+
+  preProc_BnB <- preProcess(BnB %>% select(host_since, neighbourhood, neighbourhood_group, latitude, longitude, room_type, accommodates, bathrooms_text, bedrooms, beds, number_of_reviews, last_review), method = "knnImpute")
+  BnB_imputed_models <- predict(preProc_BnB, BnB)
+  BnB$host_since <- BnB_imputed_models$host_since
+  BnB$bedrooms <- BnB_imputed_models$bedrooms
+  BnB$beds <- BnB_imputed_models$beds
+  BnB$last_review <- BnB_imputed_models$last_review
+
+  # Load and process external validation dataset
+  Evaluate <- Evaluate_original
+
+  Evaluate$host_since <- as.numeric(as.Date(Evaluate$host_since, "%Y-%m-%d"))
+  Evaluate$last_review <- as.numeric(as.Date(Evaluate$last_review, "%Y-%m-%d"))
+  Evaluate$id <- NULL; Evaluate$name <- NULL; Evaluate$host_id <- NULL; Evaluate$host_name <- NULL
+
+  Evaluate$neighbourhood <- as.numeric(factor(Evaluate$neighbourhood, levels = unique(Evaluate$neighbourhood)))
+  Evaluate$neighbourhood_group <- as.numeric(factor(Evaluate$neighbourhood_group, levels = unique(Evaluate$neighbourhood_group)))
+  Evaluate$room_type <- as.numeric(factor(Evaluate$room_type, levels = unique(Evaluate$room_type)))
+  Evaluate$bathrooms_text <- as.numeric(factor(Evaluate$bathrooms_text, levels = unique(Evaluate$bathrooms_text)))
+
+  preProc_Eval <- preProcess(Evaluate %>% select(host_since, neighbourhood, neighbourhood_group, latitude, longitude, room_type, accommodates, bathrooms_text, bedrooms, beds, number_of_reviews, last_review), method = "knnImpute")
+  Evaluate_imputed_models <- predict(preProc_Eval, Evaluate)
+  Evaluate$host_since <- Evaluate_imputed_models$host_since
+  Evaluate$bedrooms <- Evaluate_imputed_models$bedrooms
+  Evaluate$beds <- Evaluate_imputed_models$beds
+  Evaluate$last_review <- Evaluate_imputed_models$last_review
+
+  # Run final Random Forest predictive execution 
+  set.seed(100)
+  final.mod <- randomForest(price ~ ., data = Train, method = "class")
+  final.mod.pred <- predict(final.mod, newdata = Evaluate, type = "class")
+  
+  saveRDS(final.mod.pred, eval_prediction_cache)
+} else {
+  final.mod.pred <- readRDS(eval_prediction_cache)
+}
+
+# Export predictions to CSV file
+Evaluate_original$Prediction <- final.mod.pred
+write.csv(Evaluate_original, file = "Evaluate.csv", row.names = FALSE)
+
+```
+
+### 4.7 Final Thoughts
+
+This project demonstrates that BnB prices in New York City can be predicted much more accurately than baseline guessing when the model has access to geography, room type, and listing structure.
+
+The Random Forest model is the strongest final choice, and the cached preprocessing and model objects keep the workflow reproducible while avoiding unnecessary recomputation during development.
