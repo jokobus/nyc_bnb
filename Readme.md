@@ -1,4 +1,4 @@
-[![Live Preview](https://img.shields.io/badge/Live-Preview-blue)](https://htmlpreview.github.io/?https://github.com/jokobus/nyc_bnb/NYC_bnb.html)
+[![Live Preview](https://img.shields.io/badge/Live-Preview-blue)](https://htmlpreview.github.io/?https://github.com/jokobus/nyc_bnb/blob/main/NYC_bnb.html)
 
 # New York City BnB Pricing Optimization & Predictive Modeling
 

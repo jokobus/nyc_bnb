@@ -7,5 +7,4 @@
 *.toc
 *.quarto
 *.vdoc.*
-*/libs
 *.cache
